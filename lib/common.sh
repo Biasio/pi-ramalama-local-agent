@@ -147,30 +147,108 @@ find_free_port() {
 
 REAL_MODELS_JSON="$HOME/.pi/agent/models.json"
 
-# Builds a temporary models.json: the real one (if present) plus one
-# provider entry per RamaLama instance started this session, added only
-# when no existing provider entry already carries that instance's
-# baseUrl. The merge runs inside pi-sandbox-image (already built, already
-# has python3 per pi-dev/Dockerfile) — no host jq/python3 dependency.
-# Sets SESSION_MODELS_JSON on success; caller must check the return code.
+# CONFIRMED empirically (live 'ramalama serve' with no positional MODEL,
+# no --models-preset, no --models-dir): the router auto-discovers every
+# locally pulled model from its own store and registers each under a
+# deterministic name — "<scheme>-<org>-<repo>-<quant>", built by replacing
+# '/' and ':' in the bare model identifier with '-' and prefixing the
+# registry scheme. Confirmed as "huggingface-" for models pulled with no
+# explicit scheme prefix (this project's actual usage — every entry in
+# models.conf is bare). ollama:// / oci:// prefixes are UNCONFIRMED and
+# would need their own live test; ROUTER_MODELS as built by session.sh is
+# always scheme-stripped already, so this only ever produces the
+# confirmed "huggingface-" form in practice today regardless.
+#
+# Because a hand-authored preset section whose header matches that
+# derived name overrides ramalama's own auto-discovered entry (per
+# tools/server/README.md: "If the key corresponds to an existing model on
+# the server, this will be used as the default config for that model"),
+# NO 'model =' / container-path key is needed at all for any model this
+# project pulls via 'ramalama pull'. This replaces the earlier
+# unverified container-path placeholder entirely.
+router_preset_section_name() {
+    local raw="$1"
+    local scheme="huggingface"
+    if [[ "$raw" =~ ^([a-z]+)://(.*)$ ]]; then
+        # Unreached in current usage (ROUTER_MODELS is always
+        # scheme-stripped before this is called) — kept for
+        # forward-compatibility, but this branch is UNVERIFIED.
+        scheme="${BASH_REMATCH[1]}"
+        raw="${BASH_REMATCH[2]}"
+    fi
+    raw="${raw//\//-}"
+    raw="${raw//:/-}"
+    echo "${scheme}-${raw}"
+}
+
+# Renders conf/models-preset.ini: one [section] per entry in ROUTER_MODELS,
+# header matching ramalama's own auto-discovery naming (see
+# router_preset_section_name() above), body filled from
+# MODEL_PARAMS[<model>] (or DEFAULT_MODEL_PARAMS as fallback).
+# LLAMA_ARG_* keys need no translation: llama.cpp's own --models-preset
+# format accepts environment-variable-style keys verbatim (confirmed:
+# tools/server/README.md's worked example uses 'LLAMA_ARG_CACHE_RAM = 0'
+# as a section key), and MODEL_PARAMS already stores exactly that format
+# — this only reformats KEY=VALUE to KEY = VALUE, one pair per line,
+# skipping empty fields from any doubled-comma entries.
+#
+# DEFAULT_RAMALAMA_ENV is deliberately NOT included here: it mixes real
+# llama.cpp LLAMA_ARG_* options with raw backend env vars (e.g.
+# GGML_KLEIDIAI_SME) that the preset's option table has no guaranteed
+# mapping for and could silently drop. It stays on --env at the router
+# process level in _serve_router(), same as the old single-instance code.
+render_models_preset() {
+    local preset_path="$DIR/conf/models-preset.ini"
+    {
+        echo "version = 1"
+
+        local model section params pair
+        for model in "${ROUTER_MODELS[@]}"; do
+            section="$(router_preset_section_name "$model")"
+            echo
+            echo "[$section]"
+            params="${MODEL_PARAMS[$model]:-$DEFAULT_MODEL_PARAMS}"
+            local IFS=','
+            for pair in $params; do
+                [ -n "$pair" ] && echo "${pair/=/ = }"
+            done
+            unset IFS
+        done
+    } > "$preset_path"
+    echo "[Router] Preset written -> $preset_path (${#ROUTER_MODELS[@]} model section(s))"
+}
+
+# Builds a temporary models.json: the real one (if present) plus a single
+# router provider entry exposing every model in ROUTER_MODELS as
+# 'models: [{id,name},...]' under one baseUrl, added only if that baseUrl
+# isn't already registered under an existing provider. Router mode means
+# one endpoint for however many models are configured, unlike the old
+# one-provider-per-instance scheme. The merge runs inside pi-sandbox-image
+# (already built, already has python3 per pi-dev/Dockerfile) — no host
+# jq/python3 dependency. Sets SESSION_MODELS_JSON on success; caller must
+# check the return code.
 render_shadow_models_json() {
     local MERGE_DIR
     MERGE_DIR="$(mktemp -d -t pi-ramalama-models-XXXXXX)" || return 1
     SESSION_MODELS_JSON="$MERGE_DIR/models.json"
 
-    local NEW_PROVIDERS_JSON="[" sep="" i
-    for i in "${!RAMALAMA_NAMES[@]}"; do
-        NEW_PROVIDERS_JSON+="${sep}{\"key\":\"session-${RAMALAMA_NAMES[$i]}\",\"baseUrl\":\"http://${RAMALAMA_NAMES[$i]}:${RAMALAMA_PORTS[$i]}/v1\",\"model\":\"${RAMALAMA_MODEL_NAMES[$i]}\"}"
+    local MODELS_ARRAY_JSON="[" sep="" m id
+    for m in "${ROUTER_MODELS[@]}"; do
+        id="$(router_preset_section_name "$m")"
+        MODELS_ARRAY_JSON+="${sep}{\"id\":\"${id}\",\"name\":\"${m}\"}"
         sep=","
     done
-    NEW_PROVIDERS_JSON+="]"
-    echo "$NEW_PROVIDERS_JSON" > "$MERGE_DIR/new_providers.json"
+    MODELS_ARRAY_JSON+="]"
+
+    cat > "$MERGE_DIR/new_provider.json" <<EOF
+{"key":"session-${ROUTER_NAME}","baseUrl":"http://${ROUTER_NAME}:${ROUTER_PORT}/v1","models":${MODELS_ARRAY_JSON}}
+EOF
 
     cat > "$MERGE_DIR/merge.py" << 'PYEOF'
 import json, pathlib, sys
 
 base_path = pathlib.Path("/base/models.json")
-new_path = pathlib.Path("/work/new_providers.json")
+new_path = pathlib.Path("/work/new_provider.json")
 out_path = pathlib.Path("/work/models.json")
 
 data = {"providers": {}}
@@ -182,26 +260,23 @@ if base_path.exists():
         data = {"providers": {}}
 data.setdefault("providers", {})
 
-# skip any session instance whose endpoint is already
-# registered under any existing provider key, whatever that key is named.
+entry = json.loads(new_path.read_text())
 existing_base_urls = {
     p.get("baseUrl") for p in data["providers"].values() if isinstance(p, dict)
 }
 
-added = 0
-for entry in json.loads(new_path.read_text()):
-    if entry["baseUrl"] in existing_base_urls:
-        continue
+if entry["baseUrl"] not in existing_base_urls:
     data["providers"][entry["key"]] = {
         "baseUrl": entry["baseUrl"],
         "api": "openai-completions",
         "apiKey": "not-needed",
-        "models": [{"id": entry["model"], "name": entry["model"]}],
+        "models": entry["models"],
     }
-    added += 1
+    print(f"[Merge] Router provider added with {len(entry['models'])} model(s).", file=sys.stderr)
+else:
+    print("[Merge] Router baseUrl already present, skipped.", file=sys.stderr)
 
 out_path.write_text(json.dumps(data, indent=2))
-print(f"[Merge] {added} new provider(s) added, {len(data['providers'])} total.", file=sys.stderr)
 PYEOF
 
     local -a MOUNTS=(-v "$MERGE_DIR:/work:Z")
@@ -213,7 +288,7 @@ PYEOF
         SESSION_MODELS_JSON=""
         return 1
     fi
-    echo "[Session] Shadow models.json ready (${#RAMALAMA_NAMES[@]} session provider(s) considered) -> $SESSION_MODELS_JSON"
+    echo "[Session] Shadow models.json ready (router, ${#ROUTER_MODELS[@]} model(s)) -> $SESSION_MODELS_JSON"
 }
 
 # Renders an ephemeral compose override that shadows
@@ -263,6 +338,12 @@ REAL_PROJECT_SETTINGS_JSON="$PI_RAMALAMA_WD/.pi/settings.json"
 # .pi/settings.json is preserved verbatim except for that
 # one key. Sets SESSION_SETTINGS_JSON on success.
 render_session_settings() {
+    if [ "${#ROUTER_MODELS[@]}" -eq 0 ]; then
+        echo "[Session] No specific model selected (router will auto-serve everything local); leaving defaultModel untouched."
+        SESSION_SETTINGS_JSON=""
+        return 0
+    fi
+
     local MERGE_DIR
     MERGE_DIR="$(mktemp -d -t pi-ramalama-settings-XXXXXX)" || return 1
     SESSION_SETTINGS_JSON="$MERGE_DIR/settings.json"
@@ -291,7 +372,7 @@ PYEOF
     [ -f "$REAL_PROJECT_SETTINGS_JSON" ] && MOUNTS+=(-v "$REAL_PROJECT_SETTINGS_JSON:/base/settings.json:ro,Z")
 
     if ! $ENGINE run --rm "${MOUNTS[@]}" --entrypoint python3 pi-sandbox-image \
-        /work/merge.py "${RAMALAMA_MODEL_NAMES[0]}"; then
+        /work/merge.py "$(router_preset_section_name "${ROUTER_MODELS[0]}")"; then
         echo "[Error] Failed to build shadow project settings.json." >&2
         rm -rf "$MERGE_DIR"
         SESSION_SETTINGS_JSON=""
