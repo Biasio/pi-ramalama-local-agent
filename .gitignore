@@ -10,4 +10,4 @@ compose.mounts.override.yaml
 # mount) — torn down when the session ends
 compose.session.override.yaml
 
-hooks.d/*
+hooks.d/post-start
