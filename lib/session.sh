@@ -249,6 +249,10 @@ start_env() {
     render_session_settings || exit 1
     render_session_override
 
+    if [[ -x "${PI_RAMALAMA_HOOKS_DIR:-conf/hooks.d}/post-router-start" ]]; then
+        "${PI_RAMALAMA_HOOKS_DIR:-conf/hooks.d}/post-router-start"
+    fi
+
     ensure_pi_agent_removed
     echo "[Compose] Starting pi-agent..."
     export PI_RPC_PORT
@@ -283,6 +287,10 @@ start_rpc() {
 
     echo "[RPC] Log: $RAMALAMA_SERVE_LOG"
     wait_for_ramalama "$ROUTER_PORT" "${RAMALAMA_HEALTHCHECK_TIMEOUT:-60}" || exit 1
+
+    if [[ -x "${PI_RAMALAMA_HOOKS_DIR:-conf/hooks.d}/post-router-start" ]]; then
+        "${PI_RAMALAMA_HOOKS_DIR:-conf/hooks.d}/post-router-start"
+    fi
 
     ensure_pi_agent_removed
     export PI_RPC_PORT
