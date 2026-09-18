@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Parses optimus.py's "Best config: {...}" line from stdin into a
-comma-separated LLAMA_ARG_* list on stdout. Used by lib/model.sh:benchmark().
+comma-separated LLAMA_ARG_* list on stdout. Used by lib/model.sh:benchmark(), runs inside llama-optimus-sandbox.
 
-Maintenance note: key_map is empty by default (fallback: automatic
+Maintenance note: key_map lists the exceptions (fallback: automatic
 uppercasing of the param name). If optimus.py returns keys that don't map
 directly to LLAMA_ARG_<UPPERCASE_KEY>, add explicit exceptions here.
 

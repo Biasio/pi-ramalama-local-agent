@@ -42,16 +42,15 @@ directly, no python dependencies and executables on the host except for ramalama
 │                                                                          │
 │   llama-optimus (compose service, "benchmark" profile, runs on-demand)   │
 │     - works out optimal batch size / tensor overrides for a model        │
-│     - uses a llama-bench binary copied byte-for-byte from the ramalama   │
-│       container at build time (COPY --from), nothing mounted or proxied  │
-│     - its output is parsed by a second, throwaway container from the     │
-│       same image                                                         │
+│     - built on the ramalama image, so llama-bench is the same binary     │
+│     - its output is parsed in the same container run                     │
 │                                                                          │
 └──────────────────────────────────────────────────────────────────────────┘
 
 Scripts and config files short description:
   pi-ramalama              → CLI arguments dispatcher, it's the main executable
-  lib/*.sh, lib/*.py     → the actual logic, one module per responsibility
+  lib/*.sh               → the actual logic, one module per responsibility
+  python/*.py            → JSON merge + benchmark parsing, run inside containers only
   conf/env.conf            → project variables defaults, don't edit
   conf/user.env.conf        → your own values, override env.conf
   conf/pi-mounts.conf         → extra bind mount points for pi-agent (optional)
@@ -65,20 +64,20 @@ Scripts and config files short description:
 | File | Role |
 |---|---|
 | `pi-ramalama` | Dispatcher: reads the arguments, sources `lib/*.sh`, calls the right function |
-| `lib/common.sh` | Detects the engine (Podman/Docker), the `compose()` wrapper, resolves `ramalama` in PATH, renders extra mounts |
-| `lib/env.sh` | Idempotent bootstrap (`ensure_environment`) and destructive teardown (`remove_env`) |
-| `lib/extensions.sh` | Runs `conf/pi-extensions.conf` inside `pi-agent` |
+| `lib/common.sh` | Shared helpers: engine (Podman/Docker), `compose()` wrapper, `ramalama` resolution, prompts, bash-only HTTP healthcheck and port allocation |
+| `lib/env.sh` | Idempotent bootstrap (`ensure_environment`), extra mounts, `conf/pi-extensions.conf` runner, destructive teardown (`remove_env`) |
 | `lib/model.sh` | Model lifecycle: pull, benchmark, remove, update saved params |
 | `lib/session.sh` | Session lifecycle: TUI startup, RPC start/stop |
-| `lib/pi-wrapper.sh.tmpl` | Template for the host→container `pi` proxy, rendered by `ensure_environment()` |
-| `lib/parse_benchmark.py` | Extracts `Best config: {...}` from `optimus.py`'s output. Runs **inside** the container, never on the host |
+| `lib/pi-wrapper.sh` | Host→container `pi` proxy, symlinked to `~/.local/bin/pi` by `ensure_environment()` |
+| `python/parse_benchmark.py` | Extracts `Best config: {...}` from `optimus.py`'s output. Runs **inside** `llama-optimus-sandbox`, never on the host |
+| `python/session_json.py` | Builds the session's shadow `models.json` and project `settings.json`. Runs **inside** `pi-sandbox-image`, never on the host |
 | `conf/env.conf` | Project defaults — don't edit this one directly |
 | `conf/user.env.conf` | Your personal overrides (ports, CPU/RAM budget, RamaLama images, per-model params). Start from `conf/user.env.conf.example` |
 | `conf/pi-mounts.conf` | Extra mounts for `pi-agent`, one per line. Start from `conf/pi-mounts.conf.example` |
 | `conf/pi-extensions.conf` | Commands to install extensions inside `pi-agent`. Start from `conf/pi-extensions.conf.example` |
 | `conf/models.conf` | Auto-generated (created empty on first run if missing) — holds the per-model params discovered by pull/benchmark, don't hand-edit |
 | `pi-dev/Dockerfile` | `pi-sandbox-image` (Node 24 + `pi-coding-agent` + toolchain) |
-| `optimus/Dockerfile` | `llama-optimus-sandbox`: pinned clone + isolated Python deps + `llama-bench` copied from the ramalama container |
+| `optimus/Dockerfile` | `llama-optimus-sandbox`: pinned clone + isolated Python deps, built on the ramalama image so `llama-bench` matches |
 | `compose.yaml` | The `pi-agent` and `llama-optimus` services |
 
 ---
@@ -92,7 +91,6 @@ Scripts and config files short description:
 - `ramalama` CLI on the host — it's the orchestrator for the
   model container, so it has to be a real host binary, not itself
   containerized
-- `curl`, used by the healthchecks
 
 Every time pi-ramalama is executed it will perform a dependency check — it only
 checks and prints what's missing (and how to install it), it never
@@ -105,7 +103,7 @@ installs anything for you.
 ```bash
 git clone <this-repo>
 cd pi-ramalama-local-agent
-chmod +x pi-ramalama lib/*.sh
+chmod +x pi-ramalama lib/pi-wrapper.sh
 
 cp conf/user.env.conf.example conf/user.env.conf
 # fill in conf/user.env.conf
@@ -173,12 +171,12 @@ TTY attached (thought for extension's interactive installations):
 ```bash
 ./pi-ramalama --setup
 ```
-Host bootstrap: creates the needed directories (`~/.pi/agent`, etc.), generates the `~/.local/bin/pi` wrapper from
-`lib/pi-wrapper.sh.tmpl`, builds `pi-sandbox-image` if it's missing, and
+Host bootstrap: creates the needed directories (`~/.pi/agent`, etc.), symlinks `~/.local/bin/pi` to
+`lib/pi-wrapper.sh` (and `~/.local/bin/pi-ramalama` to the dispatcher), builds `pi-sandbox-image` if it's missing, and
 renders the mounts.
 
 > Every `pi-ramalama` command, not just `--setup`, starts by checking for
-> an OCI engine, `ramalama`, and `curl` on the host. If any is missing
+> an OCI engine and `ramalama` on the host. If any is missing
 > it prints what to install and exits — it never installs anything on
 > your behalf.
 
@@ -260,26 +258,26 @@ meantime (e.g. a quick VSCode window reload).
 ## How the isolated benchmarking works
 
 1. `benchmark()` in `lib/model.sh` works out the model's path on the host
-   — it `find`s `~/.local/share/ramalama/store` for a file matching the
+   — it `find`s `$HOME` for a `.gguf` whose path contains the
    model's basename (one match: used directly; several: pick from a
    list; none: falls back to asking for the path) — and the path the
    container will see.
 
-2. It runs `compose --profile benchmark run --rm llama-optimus --model <path>`
+2. It runs one `compose --profile benchmark run --rm -T llama-optimus`
+   with `python/` mounted read-only.
 
-3. The `llama-optimus-sandbox` container runs `optimus.py`, which in turn
-   calls `llama-bench` — the exact same binary as the one in the
-   `ramalama` container, copied at build time (`COPY --from`).
+3. Inside, `optimus.py` calls `llama-bench`, the same binary the
+   `ramalama` image ships (the sandbox is built on that image). Its
+   output streams to your terminal via `tee /dev/stderr`.
 
-4. The text output (`Best config: {...}`) is piped over stdin into a
-   second, throwaway container from the same service, 
-   with `lib/parse_benchmark.py` mounted read-only.
+4. The same output is piped, in the same container, into
+   `python/parse_benchmark.py`, which prints the `LLAMA_ARG_*` list.
 
 5. The extracted params get written to `conf/models.conf`
 
 
-> Note: `key_map` in `lib/parse_benchmark.py` is empty by default (it
-> falls back to uppercasing the param name). If `optimus.py` returns keys
+> Note: `key_map` in `python/parse_benchmark.py` lists the exceptions (it
+> otherwise falls back to uppercasing the param name). If `optimus.py` returns keys
 > that don't map cleanly to `LLAMA_ARG_<KEY>`, add an explicit exception
 > there.
 ---

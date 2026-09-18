@@ -3,11 +3,9 @@
 # `compose up`). llama-optimus is a one-shot benchmark runner, gated
 # behind the "benchmark" profile so it never starts on a plain `compose up`
 # and only runs when lib/model.sh explicitly invokes it with
-# `--profile benchmark run --rm`. On Docker, compose.docker.yaml (if
-# present) is layered on top of this file; conf/pi-mounts.conf renders
-# into compose.mounts.override.yaml, layered on top of that.
-version: '3.8'
-
+# `--profile benchmark run --rm`. conf/pi-mounts.conf renders into
+# compose.mounts.override.yaml and each TUI session writes
+# compose.session.override.yaml; both are layered on top of this file.
 services:
   pi-agent:
     build:
@@ -32,12 +30,6 @@ services:
     stdin_open: true
     entrypoint: ["sleep", "infinity"]
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "pi", "--version"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
 
   llama-optimus:
     build:
