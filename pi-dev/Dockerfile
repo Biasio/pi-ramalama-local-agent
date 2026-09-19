@@ -11,7 +11,7 @@ ARG PI_CODING_AGENT_VERSION=latest
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgl1 libglu1-mesa libosmesa6 \
         git curl python3 python3-pip ripgrep jq fd-find sqlite3 \
-        build-essential cmake ca-certificates \
+        build-essential cmake ca-certificates util-linux\
     && rm -rf /var/lib/apt/lists/* \
     && ln -s /usr/bin/fdfind /usr/local/bin/fd
 
@@ -19,6 +19,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # is deleted in the same layer that creates it.
 RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent@${PI_CODING_AGENT_VERSION} \
     && rm -rf /root/.npm
+
+
+# Confinement wrapper for agent-initiated pi runs; see pi-dev/confined.sh.
+COPY pi-dev/confined.sh /usr/local/bin/pi-confined
+RUN chmod 755 /usr/local/bin/pi-confined
 
 # Must come after every build-time npm/pip install.
 ENV NPM_CONFIG_PREFIX=/opt/npm-global-runtime

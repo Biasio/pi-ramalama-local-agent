@@ -180,7 +180,7 @@ start_env() {
     render_session_files || exit 1
     run_post_start_hook
     start_pi_agent
-    $ENGINE exec -it pi-agent pi "$@"
+    $ENGINE exec -it pi-agent pi-confined pi "$@"
 }
 
 # Blocking RPC bootstrap: waits for the router to be healthy.

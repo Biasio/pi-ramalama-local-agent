@@ -27,7 +27,7 @@ fi
 
 if [ "$1" == "--version" ]; then
     if $ENGINE ps --format '{{.Names}}' 2>/dev/null | grep -qx pi-agent; then
-        exec $ENGINE exec -i pi-agent pi "$@"
+        exec $ENGINE exec -i pi-agent pi-confined pi "$@"
     fi
     exec $ENGINE run --rm pi-sandbox-image pi "$@"
 fi
